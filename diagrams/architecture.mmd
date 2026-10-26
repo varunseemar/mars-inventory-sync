@@ -1,0 +1,62 @@
+flowchart LR
+    subgraph IN["Orders in"]
+        WEB["Own website<br/>(webhook)"]
+        NYK["Nykaa<br/>(webhook, dupes / out of order)"]
+        BLK["Blinkit<br/>(webhook)"]
+        FK["Flipkart<br/>(polled every 2 min)"]
+    end
+
+    subgraph AWS["AWS ap-south-1 · ECS Fargate · one Docker image, two services"]
+        subgraph API["api service (Express)"]
+            WH["Webhook routes<br/>verify signature + Zod<br/>enqueue → 200"]
+            OPS["Ops screen<br/>failed syncs + Retry<br/>SKU history · Ask (LLM)"]
+        end
+
+        RD[("Redis · ElastiCache<br/>BullMQ queues<br/>rate limits")]
+
+        subgraph WRK["worker service (BullMQ)"]
+            POLL["flipkart-poller"]
+            ING["ingest worker<br/>dedup + reserve stock<br/>one DB transaction"]
+            PUSH["stock-push workers<br/>one queue per channel"]
+            ERPW["erp-sender<br/>+ 5-min PENDING sweep"]
+        end
+
+        PG[("PostgreSQL · RDS<br/>orders · inventory<br/>stock_movements<br/>stock_push_log · sync_failures")]
+    end
+
+    subgraph OUT["Stock / orders out"]
+        NYKO["Nykaa API<br/>5 req/s, 1 SKU"]
+        FKO["Flipkart API<br/>10 req/s, 50 SKUs"]
+        BLKO["Blinkit API + nightly CSV<br/>~2% timeouts"]
+        ERP["Business Central ERP<br/>down Sundays 1-2 h"]
+    end
+
+    LLM["Claude API<br/>(Stretch B, read-only)"]
+    USER["Ops team"]
+
+    WEB --> WH
+    NYK --> WH
+    BLK --> WH
+    FK -. "poll" .- POLL
+
+    WH -- "ingest job" --> RD
+    POLL -- "ingest job" --> RD
+    RD --> ING
+    ING -- "order + reserve + audit row" --> PG
+    ING -- "push + ERP jobs" --> RD
+    RD --> PUSH
+    RD --> ERPW
+
+    PUSH --> NYKO
+    PUSH --> FKO
+    PUSH --> BLKO
+    ERPW -- "idempotent create" --> ERP
+
+    PUSH -- "push log / failures" --> PG
+    ERPW -- "erp_status / failures" --> PG
+
+    PG -. "website reads live stock" .-> WEB
+
+    USER --> OPS
+    OPS -- "read + retry" --> PG
+    OPS -. "SKU rows + question" .-> LLM
